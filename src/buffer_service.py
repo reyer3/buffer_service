@@ -1,46 +1,63 @@
+"""
+Buffer Service - FastAPI Application
+Servicio de buffering para mensajes con agregación y webhooks.
+"""
+
+# =============================
+# Imports y configuración
+# =============================
 import asyncio
+import json
+import logging
 from asyncio import Task
 from contextlib import asynccontextmanager
-import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
-import json
 
 import httpx
-from fastapi import HTTPException, status
+import redis.asyncio as redis
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl, ValidationError
 
-import redis.asyncio as redis
-from redis.commands.core import AsyncScript
-
+# Constantes y logging
 UTC = timezone.utc
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
+# =============================
+# Modelos Pydantic
+# =============================
 class WebhookConfig(BaseModel):
-    """Configuration for the webhook."""
+    """Configuración para el webhook."""
     url: HttpUrl
     method: str = Field(default="POST")
     headers: Dict[str, str] = Field(default={})
 
 
 class BufferConfig(BaseModel):
-    """Configuration for the buffer."""
+    """Configuración para el buffer."""
     key: str
     wait_time: int = Field(gt=0)
     aggregate_field: str
     max_size: int = Field(gt=0)
+    # Se incluye opcionalmente el webhook para usarlo en el procesamiento
+    webhook: Optional[WebhookConfig] = None
 
 
 class BufferRequest(BaseModel):
-    """Request to add message to buffer."""
+    """Request para añadir un mensaje al buffer."""
     webhook: WebhookConfig
     buffer: BufferConfig
     payload: Dict[str, Any]
 
 
 class BufferMetadata(BaseModel):
-    """Metadata about the processed buffer."""
+    """Metadata sobre el buffer procesado."""
     total_messages: int
     first_message: str
     last_message: str
@@ -50,15 +67,18 @@ class BufferMetadata(BaseModel):
 
 
 class BufferResponse(BaseModel):
-    """Response from processing the buffer."""
+    """Respuesta del procesamiento del buffer."""
     buffer_key: str
     messages: List[Dict[str, Any]]
     aggregated_content: str
     metadata: BufferMetadata
 
 
+# =============================
+# Funciones auxiliares
+# =============================
 async def aggregate_messages(messages: List[Dict[str, Any]], aggregate_field: str) -> str:
-    """Aggregate messages based on the configured field."""
+    """Agrega los mensajes según el campo configurado."""
     aggregated_list: List[str] = []
     for message in messages:
         try:
@@ -79,7 +99,7 @@ async def aggregate_messages(messages: List[Dict[str, Any]], aggregate_field: st
             if value is not None:
                 aggregated_list.append(str(value))
         except (KeyError, TypeError):
-            logger.warning(f"Error accessing field {aggregate_field} in message")
+            logger.warning(f"Error accediendo al campo {aggregate_field} en el mensaje")
             return ""
     return ", ".join(aggregated_list)
 
@@ -90,7 +110,6 @@ async def _prepare_response(
 ) -> BufferResponse:
     """Prepara la respuesta de forma asíncrona."""
     aggregated_content = await aggregate_messages(messages, config.aggregate_field)
-    
     return BufferResponse(
         buffer_key=config.key,
         messages=messages,
@@ -111,17 +130,16 @@ async def _send_webhook_request(
     webhook: WebhookConfig,
     response: BufferResponse
 ) -> BufferResponse:
-    """Envía la request al webhook con mejor manejo de errores."""
+    """Envía la request al webhook con manejo de errores."""
     try:
         webhook_response = await client.request(
             method=webhook.method,
             url=str(webhook.url),
-            json=response.model_dump(mode='json'),
+            json=response.model_dump(mode="json"),
             headers=webhook.headers
         )
         webhook_response.raise_for_status()
         return response
-        
     except httpx.TimeoutException as e:
         logger.error(f"Webhook timeout: {e}")
         raise HTTPException(
@@ -145,20 +163,21 @@ async def _send_webhook_request(
 async def process_buffer(
     messages: List[Dict[str, Any]],
     config: BufferConfig,
-    webhook: WebhookConfig
+    webhook: WebhookConfig,
+    client: Optional[httpx.AsyncClient] = None
 ) -> BufferResponse:
-    """Process messages with improved concurrency handling."""
-    try:
-        response = await _prepare_response(messages, config)
-        
-        timeout = httpx.Timeout(
-            connect=5.0,    # Tiempo para conectar
-            read=10.0,      # Tiempo para leer la respuesta
-            write=5.0,      # Tiempo para escribir el request
-            pool=2.0        # Tiempo para obtener una conexión del pool
-        )
-
-        # Usar AsyncClient con mejor configuración
+    """
+    Procesa los mensajes, prepara la respuesta y envía el webhook.
+    Si se provee un cliente httpx, se utiliza; de lo contrario, se crea uno.
+    """
+    response = await _prepare_response(messages, config)
+    timeout = httpx.Timeout(
+        connect=5.0,
+        read=10.0,
+        write=5.0,
+        pool=2.0
+    )
+    if client is None:
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
@@ -166,17 +185,15 @@ async def process_buffer(
             limits=httpx.Limits(max_keepalive_connections=5)
         ) as client:
             return await _send_webhook_request(client, webhook, response)
-    except Exception as e:
-        logger.error(f"Error processing buffer: {str(e)}")
-        raise
+    else:
+        return await _send_webhook_request(client, webhook, response)
 
 
+# =============================
+# Clase BufferManager
+# =============================
 class BufferManager:
-    """Manages the buffer using Redis."""
-    _get_and_clear_script: Optional[str] = None
-    _processing_tasks: Dict[str, Task] = {}  # Tracking de tareas por buffer_key
-    _active_buffers: Set[str] = set()  # Control de buffers activos
-    
+    """Maneja el buffer utilizando Redis."""
     GET_AND_CLEAR_BUFFER_SCRIPT = """
     local messages = redis.call('LRANGE', KEYS[1], 0, -1)
     if #messages > 0 then
@@ -188,15 +205,13 @@ class BufferManager:
     """
 
     def __init__(self, redis_url: str = "redis://localhost:6379"):
-        """Initialize the BufferManager with Redis connection."""
         self.redis_url = redis_url
         self.redis: Optional[redis.Redis] = None
         self._lock = asyncio.Lock()
         self._shutdown_event = asyncio.Event()
-        self._get_and_clear_script: Optional[str] = None  # Instancia
-        self._processing_tasks: Dict[str, Task] = {}       # Instancia
-        self._active_buffers: Set[str] = set()             # Instancia
-
+        self._get_and_clear_script: Optional[str] = None
+        self._processing_tasks: Dict[str, Task] = {}
+        self._active_buffers: Set[str] = set()
 
     @asynccontextmanager
     async def get_redis(self):
@@ -213,30 +228,30 @@ class BufferManager:
             raise
 
     async def load_scripts(self) -> None:
-        """Loads the Lua scripts into Redis."""
+        """Carga los scripts Lua en Redis."""
         if self._get_and_clear_script is None:
-            async with self.get_redis() as redis:
-                self._get_and_clear_script = await redis.script_load(
+            async with self.get_redis() as redis_conn:
+                self._get_and_clear_script = await redis_conn.script_load(
                     self.GET_AND_CLEAR_BUFFER_SCRIPT
                 )
 
     async def save_config(self, config: BufferConfig) -> None:
-        """Saves the buffer configuration."""
+        """Guarda la configuración del buffer."""
         try:
             config_key = f"config:{config.key}"
             config_data = config.model_dump_json().encode()
-            async with self.get_redis() as redis:
-                await redis.set(config_key, config_data)
+            async with self.get_redis() as redis_conn:
+                await redis_conn.set(config_key, config_data)
         except Exception as e:
             logger.error(f"Error saving config: {str(e)}")
             raise
 
     async def get_config(self, key: str) -> Optional[BufferConfig]:
-        """Retrieves the buffer configuration."""
+        """Recupera la configuración del buffer."""
         try:
             config_key = f"config:{key}"
-            async with self.get_redis() as redis:
-                config_data = await redis.get(config_key)
+            async with self.get_redis() as redis_conn:
+                config_data = await redis_conn.get(config_key)
             if config_data:
                 return BufferConfig.model_validate_json(config_data.decode())
             return None
@@ -248,11 +263,11 @@ class BufferManager:
             return None
 
     async def add_message(self, request: BufferRequest) -> None:
-        print("Starting add_message")
+        logger.info("Starting add_message")
         try:
             async with self.get_redis() as redis_conn:
-                # Usamos el pipeline para agrupar las operaciones
                 async with redis_conn.pipeline() as pipe:
+                    # Se guarda la configuración (incluyendo webhook si se provee)
                     pipe.set(
                         f"config:{request.buffer.key}",
                         request.buffer.model_dump_json().encode()
@@ -266,25 +281,21 @@ class BufferManager:
                         json.dumps(message_data).encode()
                     )
                     pipe.llen(request.buffer.key)
-                    # Ejecutamos el pipeline y obtenemos los resultados
                     results = await pipe.execute()
-                    # results = [resultado_set, resultado_rpush, current_size]
                     current_size = results[2]
-                    print(f"ADD_MESSAGE: current_size: {current_size}")
-
+                    logger.info(f"ADD_MESSAGE: current_size: {current_size}")
                     if current_size >= request.buffer.max_size:
-                        print("ADD_MESSAGE: Max size condition TRUE - calling process_and_send")
+                        logger.info("ADD_MESSAGE: Tamaño máximo alcanzado - llamando process_and_send")
                         await self.process_and_send(request.buffer.key)
                         return
                     else:
-                        print("ADD_MESSAGE: Max size condition FALSE - not calling process_and_send")
+                        logger.info("ADD_MESSAGE: Tamaño máximo no alcanzado")
         except Exception as e:
-            print(f"Error in add_message: {str(e)}")
+            logger.error(f"Error in add_message: {str(e)}")
             raise
         finally:
-            print("Exiting add_message")
+            logger.info("Exiting add_message")
 
-        
     def _cleanup_task(self, buffer_key: str, task: Task) -> None:
         """Limpieza de recursos cuando una tarea termina."""
         self._processing_tasks.pop(buffer_key, None)
@@ -298,43 +309,28 @@ class BufferManager:
         """Programa el procesamiento del buffer de forma segura."""
         async with self._lock:
             if buffer_key in self._active_buffers:
-                # Ya hay un procesamiento programado
-                return
-
+                return  # Ya hay un procesamiento programado
             self._active_buffers.add(buffer_key)
-            
         try:
             task = asyncio.create_task(
                 self._delayed_processing(buffer_key, wait_time)
             )
             self._processing_tasks[buffer_key] = task
-            
-            # Asegurar limpieza cuando la tarea termine
-            task.add_done_callback(
-                lambda t: self._cleanup_task(buffer_key, t)
-            )
+            task.add_done_callback(lambda t: self._cleanup_task(buffer_key, t))
         except Exception as e:
             logger.error(f"Error scheduling processing: {e}")
             self._active_buffers.discard(buffer_key)
             raise
 
     async def _delayed_processing(self, buffer_key: str, wait_time: int) -> None:
-        """Manejo mejorado del procesamiento retrasado."""
+        """Manejo del procesamiento retrasado."""
         try:
-            # Usar wait_for para manejar cancelación
-            await asyncio.wait_for(
-                asyncio.sleep(wait_time),
-                timeout=wait_time + 1  # Pequeño margen
-            )
-
-            async with self.get_redis() as redis:
-                # Verificar condiciones atomicamente
-                exists = await redis.exists(buffer_key)
-                size = await redis.llen(buffer_key) if exists else 0
-                
+            await asyncio.wait_for(asyncio.sleep(wait_time), timeout=wait_time + 1)
+            async with self.get_redis() as redis_conn:
+                exists = await redis_conn.exists(buffer_key)
+                size = await redis_conn.llen(buffer_key) if exists else 0
                 if exists and size > 0:
                     await self.process_and_send(buffer_key)
-                
         except asyncio.CancelledError:
             logger.info(f"Processing cancelled for buffer {buffer_key}")
             raise
@@ -347,27 +343,24 @@ class BufferManager:
                 self._active_buffers.discard(buffer_key)
 
     async def process_and_send(self, buffer_key: str) -> None:
-        # Adquirir el lock para realizar la verificación de forma atómica.
+        """Procesa el buffer y envía la información al webhook."""
         async with self._lock:
             if buffer_key in self._active_buffers:
-                return  # Ya se está procesando este buffer.
+                return  # Ya se está procesando este buffer
             self._active_buffers.add(buffer_key)
         try:
             config = await self.get_config(buffer_key)
             if not config:
                 return
-
             messages = await self.get_and_clear_buffer(buffer_key)
             if not messages:
                 return
-
             if task := self._processing_tasks.get(buffer_key):
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
-
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await self._send_to_webhook(messages, config, client)
         except Exception as e:
@@ -377,14 +370,13 @@ class BufferManager:
             async with self._lock:
                 self._active_buffers.discard(buffer_key)
 
-
     async def get_and_clear_buffer(self, buffer_key: str) -> Optional[List[bytes]]:
-        """Atomically gets and clears the buffer using a Lua script."""
+        """Recupera y limpia atómicamente el buffer usando un script Lua."""
         try:
             await self.load_scripts()
             if self._get_and_clear_script:
-                async with self.get_redis() as redis:
-                    messages = await redis.evalsha(
+                async with self.get_redis() as redis_conn:
+                    messages = await redis_conn.evalsha(
                         self._get_and_clear_script,
                         keys=[buffer_key]
                     )
@@ -394,11 +386,28 @@ class BufferManager:
             logger.error(f"Error getting and clearing buffer: {str(e)}")
             raise
 
-    async def clear_buffer(self, buffer_key: str) -> None:
-        """Clears the buffer and its configuration."""
+    async def _send_to_webhook(
+        self, messages: List[bytes], config: BufferConfig, client: httpx.AsyncClient
+    ) -> None:
+        """
+        Decodifica los mensajes y llama a process_buffer usando el cliente provisto.
+        Se requiere que en la configuración esté definido el webhook.
+        """
+        if not config.webhook:
+            logger.error("No hay configuración de webhook en el buffer")
+            return
         try:
-            async with self.get_redis() as redis:
-                async with redis.pipeline() as pipe:
+            decoded_messages = [json.loads(m.decode()) for m in messages]
+            await process_buffer(decoded_messages, config, config.webhook, client)
+        except Exception as e:
+            logger.error(f"Error enviando al webhook: {e}")
+            raise
+
+    async def clear_buffer(self, buffer_key: str) -> None:
+        """Limpia el buffer y su configuración."""
+        try:
+            async with self.get_redis() as redis_conn:
+                async with redis_conn.pipeline() as pipe:
                     await pipe.delete(buffer_key)
                     await pipe.delete(f"config:{buffer_key}")
                     await pipe.execute()
@@ -409,16 +418,82 @@ class BufferManager:
     async def shutdown(self) -> None:
         """Limpieza ordenada de recursos."""
         self._shutdown_event.set()
-        
-        # Cancelar todas las tareas pendientes
         tasks = list(self._processing_tasks.values())
         for task in tasks:
             task.cancel()
-        
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Cerrar conexión Redis
         if self.redis:
             await self.redis.close()
             self.redis = None
+
+
+# Instancia global de BufferManager
+buffer_manager = BufferManager()
+
+
+# =============================
+# FastAPI: Lifespan y Endpoints
+# =============================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Contexto de vida de la aplicación."""
+    logger.info("Iniciando Buffer Service...")
+    await buffer_manager.load_scripts()
+    yield  # La aplicación se ejecuta aquí
+    logger.info("Cerrando Buffer Service...")
+    await buffer_manager.shutdown()
+
+
+app = FastAPI(
+    title="Buffer Service",
+    description="Servicio de buffering para mensajes con agregación y webhooks",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Configuración de CORS (en producción, limitar los orígenes)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.post("/message", response_model=Dict[str, Any])
+async def add_message(request: BufferRequest) -> Dict[str, Any]:
+    """
+    Añade un mensaje al buffer.
+    El mensaje se procesa cuando se alcanza el tamaño máximo o transcurre el tiempo configurado.
+    """
+    try:
+        await buffer_manager.add_message(request)
+        return {
+            "status": "success",
+            "message": "Mensaje añadido al buffer",
+            "buffer_key": request.buffer.key
+        }
+    except Exception as e:
+        logger.error(f"Error al añadir mensaje: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.get("/health")
+async def health_check() -> Dict[str, str]:
+    """Endpoint para health check."""
+    return {"status": "healthy"}
+
+
+@app.get("/metrics")
+async def metrics() -> Dict[str, Any]:
+    """Endpoint para métricas básicas."""
+    return {
+        "uptime": "...",
+        "total_messages_processed": "...",
+        "active_buffers": list(buffer_manager._active_buffers)
+    }
