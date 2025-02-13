@@ -4,3 +4,4 @@ pydantic[email]
 python-dotenv
 httpx
 redis
+prometheus-client

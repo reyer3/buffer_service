@@ -1,3 +1,4 @@
+from enum import Enum
 import os
 import asyncio
 import json
@@ -7,6 +8,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
+from prometheus_client import Counter, Gauge, generate_latest
+from fastapi.responses import PlainTextResponse
 import httpx
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, status
@@ -19,8 +22,9 @@ load_dotenv()
 
 # Constantes y configuración de logging
 UTC = timezone.utc
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
@@ -68,6 +72,29 @@ class BufferResponse(BaseModel):
     messages: List[Dict[str, Any]]
     aggregated_content: str
     metadata: BufferMetadata
+
+class ErrorCode(Enum):
+    BUFFER_FULL = "BUFFER_FULL"
+    WEBHOOK_FAILED = "WEBHOOK_FAILED"
+    REDIS_ERROR = "REDIS_ERROR"
+    INVALID_CONFIG = "INVALID_CONFIG"
+
+class DetailedHTTPException(HTTPException):
+    def __init__(
+        self,
+        status_code: int,
+        error_code: ErrorCode,
+        detail: str,
+        headers: Optional[dict] = None
+    ):
+        super().__init__(
+            status_code=status_code,
+            detail={
+                "error_code": error_code.value,
+                "message": detail
+            },
+            headers=headers
+        )
 
 
 # =============================
@@ -470,6 +497,16 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(DetailedHTTPException)
+async def detailed_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "status": "error",
+            "error": exc.detail
+        }
+    )
+
 @app.post("/message", response_model=Dict[str, Any])
 async def add_message(request: BufferRequest) -> Dict[str, Any]:
     """
@@ -496,12 +533,27 @@ async def health_check() -> Dict[str, str]:
     """Endpoint para health check."""
     return {"status": "healthy"}
 
+# Métricas Prometheus
+MESSAGES_PROCESSED = Counter('buffer_messages_processed_total', 'Total de mensajes procesados')
+ACTIVE_BUFFERS = Gauge('buffer_active_buffers', 'Número de buffers activos')
+PROCESSING_TIME = Counter('buffer_processing_time_seconds', 'Tiempo de procesamiento', ['buffer_key'])
+WEBHOOK_FAILURES = Counter('buffer_webhook_failures_total', 'Total de fallos en webhooks')
 
 @app.get("/metrics")
-async def metrics() -> Dict[str, Any]:
-    """Endpoint para métricas básicas."""
-    return {
-        "uptime": "...",
-        "total_messages_processed": "...",
-        "active_buffers": list(buffer_manager._active_buffers)
-    }
+async def metrics() -> PlainTextResponse:
+    """Endpoint mejorado para métricas en formato Prometheus."""
+    ACTIVE_BUFFERS.set(len(buffer_manager._active_buffers))
+    return PlainTextResponse(generate_latest())
+
+@app.post("/log-level")
+async def set_log_level(level: str) -> Dict[str, str]:
+    """Cambiar el nivel de logging en tiempo de ejecución."""
+    try:
+        level = level.upper()
+        logging.getLogger().setLevel(getattr(logging, level))
+        return {"status": "success", "message": f"Nivel de logging cambiado a {level}"}
+    except (AttributeError, ValueError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Nivel de logging inválido. Use: DEBUG, INFO, WARNING, ERROR, o CRITICAL"
+        )
