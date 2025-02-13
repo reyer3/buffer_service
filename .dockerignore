@@ -1,0 +1,18 @@
+# Ignorar el entorno virtual y archivos generados por Python
+venv/
+*.egg-info
+__pycache__/
+*.pyc
+*.pyo
+*$py.class
+
+# Ignorar tests y archivos de testing que no son necesarios en producción
+tests/
+test-requirements.txt
+
+# Ignorar archivos y directorios de Git
+.git/
+.gitignore
+
+# Opcional: ignorar archivos de entorno local
+.env
