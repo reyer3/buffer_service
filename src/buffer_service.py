@@ -1,11 +1,4 @@
-"""
-Buffer Service - FastAPI Application
-Servicio de buffering para mensajes con agregación y webhooks.
-"""
-
-# =============================
-# Imports y configuración
-# =============================
+import os
 import asyncio
 import json
 import logging
@@ -19,15 +12,18 @@ import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl, ValidationError
+from dotenv import load_dotenv
 
-# Constantes y logging
+# Cargar variables del .env
+load_dotenv()
+
+# Constantes y configuración de logging
 UTC = timezone.utc
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
 
 # =============================
 # Modelos Pydantic
@@ -45,7 +41,7 @@ class BufferConfig(BaseModel):
     wait_time: int = Field(gt=0)
     aggregate_field: str
     max_size: int = Field(gt=0)
-    # Se incluye opcionalmente el webhook para usarlo en el procesamiento
+    # Opcionalmente se puede incluir el webhook
     webhook: Optional[WebhookConfig] = None
 
 
@@ -204,7 +200,19 @@ class BufferManager:
     end
     """
 
-    def __init__(self, redis_url: str = "redis://localhost:6379"):
+    def __init__(self, redis_url: Optional[str] = None):
+        # Si no se provee un redis_url, se construye a partir del .env
+        if redis_url is None:
+            redis_host = os.getenv("REDIS_HOST", "localhost")
+            redis_port = os.getenv("REDIS_PORT", "6379")
+            redis_db = os.getenv("REDIS_DB", "0")
+            redis_password = os.getenv("REDIS_PASSWORD", "")
+            redis_ssl = os.getenv("REDIS_SSL", "false").lower() == "true"
+            scheme = "rediss" if redis_ssl else "redis"
+            if redis_password:
+                redis_url = f"{scheme}://:{redis_password}@{redis_host}:{redis_port}/{redis_db}"
+            else:
+                redis_url = f"{scheme}://{redis_host}:{redis_port}/{redis_db}"
         self.redis_url = redis_url
         self.redis: Optional[redis.Redis] = None
         self._lock = asyncio.Lock()
@@ -267,7 +275,7 @@ class BufferManager:
         try:
             async with self.get_redis() as redis_conn:
                 async with redis_conn.pipeline() as pipe:
-                    # Se guarda la configuración (incluyendo webhook si se provee)
+                    # Guardar configuración (incluyendo webhook, si se provee)
                     pipe.set(
                         f"config:{request.buffer.key}",
                         request.buffer.model_dump_json().encode()
@@ -309,7 +317,7 @@ class BufferManager:
         """Programa el procesamiento del buffer de forma segura."""
         async with self._lock:
             if buffer_key in self._active_buffers:
-                return  # Ya hay un procesamiento programado
+                return  # Procesamiento ya programado
             self._active_buffers.add(buffer_key)
         try:
             task = asyncio.create_task(
@@ -346,7 +354,7 @@ class BufferManager:
         """Procesa el buffer y envía la información al webhook."""
         async with self._lock:
             if buffer_key in self._active_buffers:
-                return  # Ya se está procesando este buffer
+                return  # Buffer ya en proceso
             self._active_buffers.add(buffer_key)
         try:
             config = await self.get_config(buffer_key)
