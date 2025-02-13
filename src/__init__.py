@@ -1,6 +1,4 @@
-"""
-Buffer Service Implementation
-"""
+"""Buffer Service Implementation"""
 from .buffer_service import (
     app,
     BufferManager,
@@ -9,7 +7,6 @@ from .buffer_service import (
     BufferRequest,
     BufferResponse,
     BufferMetadata,
-    get_redis
 )
 
 __all__ = [
@@ -20,5 +17,4 @@ __all__ = [
     'BufferRequest',
     'BufferResponse',
     'BufferMetadata',
-    'get_redis'
 ]

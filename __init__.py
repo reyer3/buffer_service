@@ -1,17 +1,4 @@
-"""
-Buffer Service for message aggregation
-"""
-from .src.buffer_service import (
-    app,
-    BufferManager,
-    BufferConfig,
-    WebhookConfig,
-    BufferRequest,
-    BufferResponse,
-    BufferMetadata,
-    get_redis
-)
-
+"""Buffer Service for message aggregation"""
 __version__ = '0.1.0'
 __all__ = [
     'app',
@@ -21,5 +8,4 @@ __all__ = [
     'BufferRequest',
     'BufferResponse',
     'BufferMetadata',
-    'get_redis'
 ]
