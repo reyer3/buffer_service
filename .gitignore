@@ -224,4 +224,4 @@ uvicorn_error.log
 Dockerfile
 docker-compose.yml
 .dockerignore  #  Important to have a .dockerignore *too*!
-# docker/    # If you have a docker directory with further config.
+# docker/    # If you have a docker directory with further config.venv/
