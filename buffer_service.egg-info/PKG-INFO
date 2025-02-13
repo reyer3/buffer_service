@@ -1,0 +1,10 @@
+Metadata-Version: 2.2
+Name: buffer_service
+Version: 0.1.0
+Requires-Dist: fastapi
+Requires-Dist: uvicorn
+Requires-Dist: redis
+Requires-Dist: aiohttp
+Requires-Dist: pydantic
+Requires-Dist: python-dotenv
+Dynamic: requires-dist
