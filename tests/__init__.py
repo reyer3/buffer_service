@@ -18,9 +18,10 @@ pytest.register_assert_rewrite('tests.test_buffer_service')
 
 # Variables de configuración para tests
 TEST_SETTINGS = {
-    'REDIS_HOST': 'localhost',
-    'REDIS_PORT': 6379,
-    'DEFAULT_WAIT_TIME': 15,
-    'MAX_BUFFER_SIZE': 10,
-    'TEST_WEBHOOK_URL': 'http://test.com/webhook'
+    "TEST_WEBHOOK_URL": "http://test.com/webhook",
+    "TEST_BUFFER_KEY": "test_user@whatsapp.net",
+    "TEST_AGGREGATE_FIELD": "json.input.data.query",
+    "TEST_WAIT_TIME": 15,
+    "TEST_MAX_SIZE": 2,
+    "REDIS_URL": "redis://localhost:6379",
 }
